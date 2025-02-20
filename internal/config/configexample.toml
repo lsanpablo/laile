@@ -1,0 +1,38 @@
+[settings]
+ticker_enabled = true
+ticker_interval = 5
+
+[webhook_services.stripe]
+path = "stripewebhook"
+authentication_type = "header"
+authentication_header = "Stripe-Signature"
+authentication_secret = "${STRIPE_WEBHOOK_SECRET}"
+
+  [webhook_services.stripe.forwarders.payment_processor]
+  type = "http"
+  url = "https://internal-payment-processor.company.com/stripe-events"
+  headers = { "X-Internal-Token" = "${INTERNAL_TOKEN}" }
+  retry_count = 5
+  retry_delay = "exponential"
+
+  [webhook_services.stripe.forwarders.payment_queue]
+  type = "amqp"
+  connection_url = "amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@localhost:5672/"
+  exchange = "payment_events"
+  routing_key = "webhooks.stripe"
+  queue = "stripe_webhook_queue"
+  durable = true
+  persistent = true
+
+[webhook_services.github]
+path = "githubhook"
+authentication_type = "header"
+authentication_header = "X-Hub-Signature"
+authentication_secret = "${GITHUB_WEBHOOK_SECRET}"
+
+  [webhook_services.github.forwarders.jira_sync]
+  type = "http"
+  url = "https://jira.internal.company.com/webhook"
+  headers = { "Authorization" = "Bearer ${JIRA_TOKEN}" }
+  retry_count = 3
+  retry_delay = "exponential"

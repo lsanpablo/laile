@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  psql:
+    image: postgres:latest
+    environment:
+      POSTGRES_DB: ${DB_DATABASE}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "${DB_PORT}:5432"
+    volumes:
+      - psql_volume:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "5672:5672"   # AMQP protocol
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: user
+      RABBITMQ_DEFAULT_PASS: password
+    volumes:
+      - "rabbitmq_data:/var/lib/rabbitmq"
+      - "rabbitmq_log:/var/log/rabbitmq"
+    restart: unless-stopped
+
+  echo-server:
+    image: ealen/echo-server:latest  # Popular echo server image
+    ports:
+      - "8080:80"  # Map to port 8080 on host
+    environment:
+      - ENABLE_ENVIRONMENT=true
+      - ENABLE_HEADERS=true
+      - ENABLE_BODY=true
+      - ENABLE_QUERY=true
+    restart: unless-stopped
+
+volumes:
+  psql_volume:
+  rabbitmq_data:
+  rabbitmq_log:

@@ -1,0 +1,50 @@
+[settings]
+listener_port = 3000
+admin_port = 3001
+ticker_enabled = true
+
+[webhook_services.github]
+path = "github"
+authentication_type = "header"
+authentication_header = "X-Hub-Signature-256"
+authentication_secret = "testing123"
+
+[webhook_services.github.forwarders.echo]
+type = "http"
+url = "http://localhost:8080/github"
+headers = { "X-Source" = "webhook-ingress" }
+retry_count = 1
+retry_delay = "fixed"
+
+[webhook_services.github.forwarders.events_queue]
+type = "amqp"
+connection_url = "amqp://user:password@localhost:5672"
+exchange = "github_events"
+routing_key = "github.webhook"
+queue = "github_webhooks"
+exchange_type = "topic"
+durable = true
+persistent = true
+
+[webhook_services.stripe]
+path = "stripe"
+authentication_type = "header"
+authentication_header = "Stripe-Signature"
+authentication_secret = "whsec_test123"
+
+[webhook_services.stripe.forwarders.echo]
+type = "http"
+url = "http://localhost:8080/stripe"
+headers = { "X-Source" = "webhook-ingress" }
+retry_count = 1
+retry_delay = "fixed"
+
+[webhook_services.stripe.forwarders.payment_events]
+type = "amqp"
+connection_url = "amqp://user:password@localhost:5672"
+exchange = "payment_events"
+routing_key = "stripe.webhook"
+queue = "stripe_webhooks"
+exchange_type = "topic"
+durable = true
+persistent = true 
