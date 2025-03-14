@@ -56,8 +56,12 @@ clean:
 	@rm -f main
 	@rm -rf tmp
 
-apply-migration:
+migrate-up:
 	@echo "Applying migration..."
 	goose -dir internal/db_models/migrations postgres "postgresql://luis:password1234@localhost:5432/laile?sslmode=disable" up
+
+migrate-down:
+	@echo "Removing migration..."
+	goose -dir internal/db_models/migrations postgres "postgresql://luis:password1234@localhost:5432/laile?sslmode=disable" down
 
 .PHONY: all build build-dev run dev test clean docker-run docker-down apply-migration

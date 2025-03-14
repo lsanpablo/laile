@@ -2,7 +2,7 @@
 // versions:
 //   sqlc v1.27.0
 
-package db_models
+package dbmodels
 
 import (
 	"database/sql/driver"
@@ -14,11 +14,12 @@ import (
 type DeliveryStatus string
 
 const (
-	DeliveryStatusFuture    DeliveryStatus = "future"
-	DeliveryStatusScheduled DeliveryStatus = "scheduled"
-	DeliveryStatusSuccess   DeliveryStatus = "success"
-	DeliveryStatusFailed    DeliveryStatus = "failed"
-	DeliveryStatusNotNeeded DeliveryStatus = "not_needed"
+	DeliveryStatusFuture     DeliveryStatus = "future"
+	DeliveryStatusScheduled  DeliveryStatus = "scheduled"
+	DeliveryStatusProcessing DeliveryStatus = "processing"
+	DeliveryStatusSuccess    DeliveryStatus = "success"
+	DeliveryStatusFailed     DeliveryStatus = "failed"
+	DeliveryStatusNotNeeded  DeliveryStatus = "not_needed"
 )
 
 func (e *DeliveryStatus) Scan(src interface{}) error {
@@ -67,6 +68,23 @@ type DeliveryAttempt struct {
 	ResponseHeaders []byte
 	ErrorMessage    pgtype.Text
 	CreatedAt       pgtype.Timestamptz
+	HashValue       int64
+	WorkerName      pgtype.Text
+}
+
+type HashRing struct {
+	ID        int32
+	NodeName  string
+	VirtualID int32
+	HashKey   int64
+}
+
+type TaskLock struct {
+	ID         int32
+	TaskName   string
+	WorkerName string
+	AcquiredAt pgtype.Timestamptz
+	TouchedAt  pgtype.Timestamptz
 }
 
 type Webhook struct {
@@ -88,4 +106,5 @@ type WebhookTarget struct {
 	WebhookID   pgtype.Int8
 	ForwarderID string
 	CreatedAt   pgtype.Timestamptz
+	HashValue   int64
 }

@@ -5,14 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/rabbitmq/amqp091-go"
-
 	"laile/internal/config"
+	"laile/internal/log"
 )
 
 type RMQForwarder struct {
@@ -33,12 +33,20 @@ func (s *session) Close() error {
 	if s.Connection == nil {
 		return nil
 	}
-	return s.Connection.Close()
+	err := s.Connection.Close()
+	if err != nil {
+		log.Logger.Error("failed to close RMQ session", slog.Any("error", err))
+		return fmt.Errorf("failed to close RMQ session: %w", err)
+	}
+	return nil
 }
 
 func NewRMQForwarder(config *config.Forwarder) *RMQForwarder {
 	return &RMQForwarder{
-		Config: config,
+		Session:    nil,
+		Config:     config,
+		ErrorCount: 0,
+		mu:         sync.Mutex{},
 	}
 }
 
@@ -60,23 +68,24 @@ func (f *RMQForwarder) declareExchange() error {
 }
 
 func (f *RMQForwarder) Forward(ctx context.Context, deliveryAttempt *DeliveryAttempt) (*DeliveryResult, error) {
-	payload, err := webhookToAMQPBody(deliveryAttempt, f.Config.Persistent)
+	payload, err := webhookToAMQPBody(deliveryAttempt)
 	if err != nil {
 		return nil, err
 	}
 
-	timeoutContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	const forwardingTimeout = 5 * time.Second
+	timeoutContext, cancel := context.WithTimeout(ctx, forwardingTimeout)
 	defer cancel()
 
 	// Single attempt to publish with proper error handling
 	err = f.publishToRMQ(timeoutContext, payload)
 	if err != nil {
-		slog.Error("producer: error publishing message", "error", err)
+		log.Logger.ErrorContext(ctx, "producer: error publishing message", "error", err)
 		return nil, err
 	}
 
 	return &DeliveryResult{
-		StatusCode: 200,
+		StatusCode: http.StatusOK,
 		Headers:    map[string][]string{},
 		Body:       nil,
 	}, nil
@@ -102,8 +111,9 @@ func (f *RMQForwarder) publishToRMQ(ctx context.Context, payload message) error 
 	})
 	if err != nil {
 		// Only dispose session on connection errors
-		if amqpErr, ok := err.(*amqp091.Error); ok && amqpErr.Code >= 300 {
-			_ = f.disposeSession()
+		var amqpErr *amqp091.Error
+		if errors.As(err, &amqpErr) && amqpErr.Code >= 300 {
+			f.disposeSession()
 		}
 		return err
 	}
@@ -115,13 +125,13 @@ type AMQPBody struct {
 	Body           json.RawMessage     `json:"body,omitempty"`
 	QueryParams    map[string][]string `json:"query_params"`
 	Method         string              `json:"method"`
-	Url            string              `json:"url"`
+	URL            string              `json:"url"`
 	IdempotencyKey string              `json:"idempotency_key"`
 	HelpText       string              `json:"help_text,omitempty"`
 }
 
 // webhookToAMQPBody marshals the DeliveryAttempt into a JSON byte slice.
-func webhookToAMQPBody(attempt *DeliveryAttempt, includeHelpText bool) (message, error) {
+func webhookToAMQPBody(attempt *DeliveryAttempt) (message, error) {
 	var headers map[string][]string
 	if err := json.Unmarshal(attempt.Headers, &headers); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal headers: %w", err)
@@ -137,15 +147,16 @@ func webhookToAMQPBody(attempt *DeliveryAttempt, includeHelpText bool) (message,
 		Body:           *attempt.Body,
 		QueryParams:    queryParams,
 		Method:         attempt.Method,
-		Url:            attempt.Url,
+		URL:            attempt.URL,
 		IdempotencyKey: attempt.IdempotencyKey,
+		HelpText:       "body is a raw JSON message, headers and query parameters are key-value maps",
 	}
-
-	if includeHelpText {
-		amqpBody.HelpText = "body is a raw JSON message, headers and query parameters are key-value maps"
+	resp, err := json.Marshal(amqpBody)
+	if err != nil {
+		log.Logger.Error("failed to marshal AMQP body", slog.Any("error", err))
+		return nil, fmt.Errorf("failed to marshal AMQP body: %w", err)
 	}
-
-	return json.Marshal(amqpBody)
+	return resp, nil
 }
 
 func (f *RMQForwarder) getSession() (*session, error) {
@@ -165,39 +176,42 @@ func (s *session) IsClosed() bool {
 
 func (f *RMQForwarder) createSession() error {
 	conn, err := amqp091.Dial(f.Config.ConnectionURL)
-	slog.Info("dialing", "url", f.Config.ConnectionURL)
+	log.Logger.Info("dialing", "url", f.Config.ConnectionURL)
 	if err != nil {
-		slog.Error("cannot dial", "error", err, "url", f.Config.ConnectionURL)
-		return err
+		log.Logger.Error("cannot dial RMQ event forwarder", "error", err, "url", f.Config.ConnectionURL)
+		return fmt.Errorf("cannot dial RMQ event forwarder: %w", err)
 	}
 
 	ch, err := conn.Channel()
 	if err != nil {
-		slog.Error("cannot create channel", "error", err)
-		return err
+		log.Logger.Error("cannot create channel", "error", err)
+		return fmt.Errorf("cannot create channel: %w", err)
 	}
 	f.Session = &session{conn, ch}
 
-	if err := f.declareExchange(); err != nil {
-		slog.Error("cannot declare exchange", "error", err)
-		return err
+	if err = f.declareExchange(); err != nil {
+		log.Logger.Error("cannot declare exchange", "error", err)
+		return fmt.Errorf("cannot declare exchange: %w", err)
 	}
 
 	return nil
 }
 
-func (f *RMQForwarder) disposeSession() error {
+func (f *RMQForwarder) disposeSession() {
 	if f.Session != nil {
-		_ = f.Session.Close()
+		err := f.Session.Close()
+		if err != nil {
+			log.Logger.Error("failed to close RMQ session", "error", err)
+		}
 		f.Session = nil
 	}
-	return nil
 }
 
 // publish publishes messages to a reconnecting session to a configured exchange.
 // It receives from the application specific source of messages.
 func (s *session) publish(parentCtx context.Context, payload message, cfg *publishConfig) error {
-	ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
+	const publishTimeout = 5 * time.Second
+	ctx, cancel := context.WithTimeout(parentCtx, publishTimeout)
 	defer cancel()
 
 	confirm := make(chan amqp091.Confirmation, 1)
@@ -205,7 +219,7 @@ func (s *session) publish(parentCtx context.Context, payload message, cfg *publi
 
 	// publisher confirms for this channel/connection
 	if err := forwarderChannel.Confirm(false); err != nil {
-		log.Printf("publisher confirms not supported")
+		log.Logger.ErrorContext(ctx, "publisher confirms not supported")
 		close(confirm) // confirms not supported, simulate by always nacking
 	} else {
 		forwarderChannel.NotifyPublish(confirm)
@@ -225,10 +239,21 @@ func (s *session) publish(parentCtx context.Context, payload message, cfg *publi
 			Priority:        0,
 			AppId:           "laile-webhook-forwarder",
 			Body:            payload,
+
+			// The following fields are not supported by the forwarder implementation,
+			// and will be populated with the zero values.
+			CorrelationId: "",
+			ReplyTo:       "",
+			Expiration:    "",
+			MessageId:     "",
+			Timestamp:     time.Time{},
+			Type:          "",
+			UserId:        "",
 		})
 	if err != nil {
 		close(confirm)
-		return err
+		log.Logger.ErrorContext(ctx, "failed to publish message", slog.Any("error", err))
+		return fmt.Errorf("failed to publish message: %w", err)
 	}
 
 	confirmed, ok := <-confirm
@@ -236,7 +261,7 @@ func (s *session) publish(parentCtx context.Context, payload message, cfg *publi
 		return errors.New("RMQ did not confirm the publish")
 	}
 	if !confirmed.Ack {
-		log.Printf("RMQ nack'd message %d, body: %q", confirmed.DeliveryTag, string(payload))
+		log.Logger.ErrorContext(ctx, "RMQ nack'd message", slog.Uint64("deliveryTag", confirmed.DeliveryTag), slog.String("body", string(payload)))
 		return errors.New("message was not acknowledged by RMQ")
 	}
 	return nil

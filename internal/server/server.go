@@ -2,14 +2,18 @@ package server
 
 import (
 	"fmt"
-	db_models "laile/internal/postgresql"
 	"net/http"
 	"time"
 
+	_ "github.com/joho/godotenv/autoload"
 	"laile/internal/config"
 	"laile/internal/database"
+	db_models "laile/internal/postgresql"
+)
 
-	_ "github.com/joho/godotenv/autoload"
+const (
+	ReadTimeout  = 10 * time.Second
+	WriteTimeout = 30 * time.Second
 )
 
 type Server struct {
@@ -21,7 +25,7 @@ type Server struct {
 
 func NewServer(db database.Service, config *config.Config) *http.Server {
 	port := config.Settings.ListenerPort
-	NewServer := &Server{
+	newServer := &Server{
 		port:    port,
 		db:      db,
 		queries: db.Queries(),
@@ -30,11 +34,11 @@ func NewServer(db database.Service, config *config.Config) *http.Server {
 
 	// Declare Server config
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", NewServer.port),
-		Handler:      NewServer.RegisterRoutes(),
+		Addr:         fmt.Sprintf(":%d", newServer.port),
+		Handler:      newServer.RegisterRoutes(),
 		IdleTimeout:  time.Minute,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  ReadTimeout,
+		WriteTimeout: WriteTimeout,
 	}
 
 	return server
@@ -54,8 +58,8 @@ func NewAdminServer(db database.Service, config *config.Config) *http.Server {
 		Addr:         fmt.Sprintf(":%d", adminServer.port),
 		Handler:      adminServer.RegisterAdminRoutes(),
 		IdleTimeout:  time.Minute,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  ReadTimeout,
+		WriteTimeout: WriteTimeout,
 	}
 
 	return server

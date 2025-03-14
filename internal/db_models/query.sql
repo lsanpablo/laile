@@ -27,8 +27,8 @@ ORDER BY da.created_at DESC
 LIMIT 1;
 
 -- name: InsertWebhookTarget :one
-INSERT INTO webhook_targets (webhook_id, forwarder_id)
-VALUES ($1, $2)
+INSERT INTO webhook_targets (webhook_id, forwarder_id, hash_value)
+VALUES ($1, $2, $3)
 RETURNING *;
 
 -- name: MarkWebhookAsScheduled :exec
@@ -135,3 +135,62 @@ FROM webhook_targets wt
          LEFT JOIN delivery_attempts da ON da.target_id = wt.id
 WHERE wt.id = $1
 GROUP BY wt.id, w.webhook_service_id, w.url;
+
+-- name: RegisterNodeInHashRing :one
+INSERT INTO hash_ring (node_name, virtual_id, hash_key)
+VALUES ($1, $2, $3)
+ON CONFLICT (node_name) DO NOTHING
+RETURNING *;
+
+-- name: GetSortedHashRing :many
+SELECT * FROM hash_ring ORDER BY hash_key;
+
+-- name: ClaimDeliveryAttempt :one
+UPDATE delivery_attempts
+SET status = 'processing', worker_name = @worker_name, executed_at = NOW()
+WHERE id = (
+    SELECT id FROM delivery_attempts
+    WHERE status = 'scheduled'
+      AND scheduled_for <= NOW()
+      AND delivery_attempts.hash_value >= @hash_start
+      AND delivery_attempts.hash_value < @hash_end
+    ORDER BY scheduled_for, hash_value
+        FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING *;
+
+-- If a node is in charge of the end of the hash ring, it needs to go back and claim the tasks
+-- from the start of the hash ring.
+-- name: ClaimDeliveryAttemptFromEnd :one
+UPDATE delivery_attempts
+SET status = 'processing', worker_name = @worker_name, executed_at = NOW()
+WHERE id = (
+    SELECT id FROM delivery_attempts
+    WHERE status = 'scheduled'
+      AND scheduled_for <= NOW()
+      AND delivery_attempts.hash_value >= @hash_end
+      OR delivery_attempts.hash_value < @hash_end
+    ORDER BY scheduled_for, hash_value
+        FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING *;
+
+-- name: ReclaimAbandonedDeliveryAttempts :exec
+UPDATE delivery_attempts
+SET status = 'scheduled', worker_name = NULL, executed_at = NULL
+WHERE status = 'processing' AND executed_at < NOW() - INTERVAL '10 minutes';
+
+-- name: AcquireTaskLock :one
+INSERT INTO task_locks (task_name, worker_name, acquired_at)
+VALUES ($1, $2, NOW())
+ON CONFLICT (task_name) DO NOTHING
+RETURNING *;
+
+-- name: ReleaseTaskLock :exec
+DELETE FROM task_locks
+WHERE task_name = $1;
+
+-- name: TouchLock :exec
+UPDATE task_locks SET touched_at = NOW() WHERE task_name = $1;

@@ -16,36 +16,37 @@ type Config struct {
 type Settings struct {
 	TickerEnabled  bool `toml:"ticker_enabled"`
 	TickerInterval int  `toml:"ticker_interval" validate:"required_if=TickerEnabled true,gte=1"`
-	ListenerPort   int  `toml:"listener_port" validate:"required,gte=1,lte=65535"`
-	AdminPort      int  `toml:"admin_port" validate:"required,gte=1,lte=65535"`
+	ListenerPort   int  `toml:"listener_port"   validate:"required,gte=1,lte=65535"`
+	AdminPort      int  `toml:"admin_port"      validate:"required,gte=1,lte=65535"`
 }
 
 type WebhookService struct {
 	Name                 string               // Populated from map key
-	Path                 string               `toml:"path" validate:"omitempty,alphanum"`
-	AuthenticationType   string               `toml:"authentication_type" validate:"omitempty,oneof=header"`
+	Path                 string               `toml:"path"                  validate:"omitempty,alphanum"`
+	AuthenticationType   string               `toml:"authentication_type"   validate:"omitempty,oneof=header"`
 	AuthenticationHeader string               `toml:"authentication_header"`
 	AuthenticationSecret string               `toml:"authentication_secret"`
-	Forwarders           map[string]Forwarder `toml:"forwarders" validate:"dive"`
+	Forwarders           map[string]Forwarder `toml:"forwarders"            validate:"dive"`
 }
 
 type Forwarder struct {
-	Name       string            // Populated from map key
-	Hash       string            // Populated during instantiation. This will be used to cache any forwarder connections in memory.
-	Type       string            `toml:"type" validate:"required,oneof=http amqp"`
-	URL        string            `toml:"url" validate:"required_if=Type http,omitempty,url"`
+	Name string // Populated from map key
+	// Hash is populated during instantiation. This will be used to cache any forwarder connections in memory.
+	Hash       string
+	Type       string            `toml:"type"        validate:"required,oneof=http amqp"`
+	URL        string            `toml:"url"         validate:"required_if=Type http,omitempty,url"`
 	Headers    map[string]string `toml:"headers"`
 	RetryCount int               `toml:"retry_count" validate:"gte=0"`
 	RetryDelay string            `toml:"retry_delay" validate:"oneof=exponential fixed"`
 
 	// AMQP specific fields
 	ConnectionURL string `toml:"connection_url" validate:"required_if=Type amqp,omitempty,url"`
-	Exchange      string `toml:"exchange" validate:"required_if=Type amqp"`
-	RoutingKey    string `toml:"routing_key" validate:"required_if=Type amqp"`
-	Queue         string `toml:"queue" validate:"required_if=Type amqp"`
+	Exchange      string `toml:"exchange"       validate:"required_if=Type amqp"`
+	RoutingKey    string `toml:"routing_key"    validate:"required_if=Type amqp"`
+	Queue         string `toml:"queue"          validate:"required_if=Type amqp"`
 	Durable       bool   `toml:"durable"`
 	Persistent    bool   `toml:"persistent"`
-	ExchangeType  string `toml:"exchange_type" validate:"required_if=Type amqp,omitempty,oneof=direct fanout topic headers"`
+	ExchangeType  string `toml:"exchange_type"  validate:"required_if=Type amqp,omitempty,oneof=direct fanout topic headers"`
 	AutoDelete    bool   `toml:"auto_delete"`
 	Exclusive     bool   `toml:"exclusive"`
 	NoWait        bool   `toml:"no_wait"`
@@ -54,21 +55,29 @@ type Forwarder struct {
 	Immediate     bool   `toml:"immediate"` // For publishing
 }
 
+const (
+	DefaultAdminPort    = 8081
+	DefaultListenerPort = 8080
+
+	// DefaultTickerInterval is the default interval for the event ticker.
+	DefaultTickerInterval = 5
+)
+
 func loadConfig(path string) (*Config, error) {
 	config := &Config{
 		Settings: Settings{
-			// Default settings that work well for most deployments
-			ListenerPort:   8080,
-			AdminPort:      8081,
+			// Default settings that work well for most deployments.
+			ListenerPort:   DefaultListenerPort,
+			AdminPort:      DefaultAdminPort,
 			TickerEnabled:  true,
-			TickerInterval: 5, // 5 second interval for retries
+			TickerInterval: DefaultTickerInterval,
 		},
 		WebhookServices: make(map[string]WebhookService),
 	}
 
 	// Read TOML file
 	if _, err := toml.DecodeFile(path, config); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode application config toml: %w", err)
 	}
 
 	// Create validator
@@ -76,7 +85,7 @@ func loadConfig(path string) (*Config, error) {
 
 	// Register custom validation for path
 	if err := validate.RegisterValidation("alphanum", validateAlphanumeric); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to register alphanum validation: %w", err)
 	}
 
 	// Populate Name fields from map keys and set defaults for each service
@@ -122,7 +131,7 @@ func loadConfig(path string) (*Config, error) {
 	return config, nil
 }
 
-// Custom validator for alphanumeric values
+// validateAlphanumeric is the custom validator for alphanumeric values.
 func validateAlphanumeric(fl validator.FieldLevel) bool {
 	value := fl.Field().String()
 	if value == "" {
@@ -136,15 +145,6 @@ func LoadMainConfig() (*Config, error) {
 	config, err := loadConfig("webhook_config.toml")
 	if err != nil {
 		panic(err)
-	}
-
-	// Access config values
-	for serviceName, service := range config.WebhookServices {
-		// Process each webhook service and its forwarders
-		println(serviceName, service.Path)
-		for _, forwarder := range service.Forwarders {
-			println(forwarder.Type)
-		}
 	}
 	return config, nil
 }

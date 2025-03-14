@@ -2,17 +2,16 @@ package main
 
 import (
 	"fmt"
+
 	"github.com/joho/godotenv"
 	"laile/internal/config"
 	"laile/internal/database"
-	"laile/internal/monitoring"
+	"laile/internal/log"
 	"laile/internal/server"
-	"log/slog"
 )
 
 func main() {
-	// Set up logging and load config
-	slog.SetDefault(monitoring.Logger)
+	log.InitLogger()
 	conf, err := config.LoadMainConfig()
 	if err != nil {
 		panic(fmt.Sprintf("cannot load config: %s", err))
@@ -23,9 +22,9 @@ func main() {
 	// Start AdminServer in a goroutine
 	go func() {
 		adminServer := server.NewAdminServer(db, conf)
-		err := adminServer.ListenAndServe()
-		if err != nil {
-			panic(fmt.Sprintf("cannot start admin server: %s", err))
+		adminServerErr := adminServer.ListenAndServe()
+		if adminServerErr != nil {
+			panic(fmt.Sprintf("cannot start admin server: %s", adminServerErr))
 		}
 	}()
 

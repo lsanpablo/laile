@@ -3,13 +3,123 @@
 //   sqlc v1.27.0
 // source: query.sql
 
-package db_models
+package dbmodels
 
 import (
 	"context"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const acquireTaskLock = `-- name: AcquireTaskLock :one
+INSERT INTO task_locks (task_name, worker_name, acquired_at)
+VALUES ($1, $2, NOW())
+ON CONFLICT (task_name) DO NOTHING
+RETURNING id, task_name, worker_name, acquired_at, touched_at
+`
+
+type AcquireTaskLockParams struct {
+	TaskName   string
+	WorkerName string
+}
+
+func (q *Queries) AcquireTaskLock(ctx context.Context, arg AcquireTaskLockParams) (TaskLock, error) {
+	row := q.db.QueryRow(ctx, acquireTaskLock, arg.TaskName, arg.WorkerName)
+	var i TaskLock
+	err := row.Scan(
+		&i.ID,
+		&i.TaskName,
+		&i.WorkerName,
+		&i.AcquiredAt,
+		&i.TouchedAt,
+	)
+	return i, err
+}
+
+const claimDeliveryAttempt = `-- name: ClaimDeliveryAttempt :one
+UPDATE delivery_attempts
+SET status = 'processing', worker_name = $1, executed_at = NOW()
+WHERE id = (
+    SELECT id FROM delivery_attempts
+    WHERE status = 'scheduled'
+      AND scheduled_for <= NOW()
+      AND delivery_attempts.hash_value >= $2
+      AND delivery_attempts.hash_value < $3
+    ORDER BY scheduled_for, hash_value
+        FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING id, target_id, status, scheduled_for, executed_at, response_code, response_body, response_headers, error_message, created_at, hash_value, worker_name
+`
+
+type ClaimDeliveryAttemptParams struct {
+	WorkerName pgtype.Text
+	HashStart  int64
+	HashEnd    int64
+}
+
+func (q *Queries) ClaimDeliveryAttempt(ctx context.Context, arg ClaimDeliveryAttemptParams) (DeliveryAttempt, error) {
+	row := q.db.QueryRow(ctx, claimDeliveryAttempt, arg.WorkerName, arg.HashStart, arg.HashEnd)
+	var i DeliveryAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.TargetID,
+		&i.Status,
+		&i.ScheduledFor,
+		&i.ExecutedAt,
+		&i.ResponseCode,
+		&i.ResponseBody,
+		&i.ResponseHeaders,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.HashValue,
+		&i.WorkerName,
+	)
+	return i, err
+}
+
+const claimDeliveryAttemptFromEnd = `-- name: ClaimDeliveryAttemptFromEnd :one
+UPDATE delivery_attempts
+SET status = 'processing', worker_name = $1, executed_at = NOW()
+WHERE id = (
+    SELECT id FROM delivery_attempts
+    WHERE status = 'scheduled'
+      AND scheduled_for <= NOW()
+      AND delivery_attempts.hash_value >= $2
+      OR delivery_attempts.hash_value < $2
+    ORDER BY scheduled_for, hash_value
+        FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING id, target_id, status, scheduled_for, executed_at, response_code, response_body, response_headers, error_message, created_at, hash_value, worker_name
+`
+
+type ClaimDeliveryAttemptFromEndParams struct {
+	WorkerName pgtype.Text
+	HashEnd    int64
+}
+
+// If a node is in charge of the end of the hash ring, it needs to go back and claim the tasks
+// from the start of the hash ring.
+func (q *Queries) ClaimDeliveryAttemptFromEnd(ctx context.Context, arg ClaimDeliveryAttemptFromEndParams) (DeliveryAttempt, error) {
+	row := q.db.QueryRow(ctx, claimDeliveryAttemptFromEnd, arg.WorkerName, arg.HashEnd)
+	var i DeliveryAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.TargetID,
+		&i.Status,
+		&i.ScheduledFor,
+		&i.ExecutedAt,
+		&i.ResponseCode,
+		&i.ResponseBody,
+		&i.ResponseHeaders,
+		&i.ErrorMessage,
+		&i.CreatedAt,
+		&i.HashValue,
+		&i.WorkerName,
+	)
+	return i, err
+}
 
 const countDueDeliveryAttempts = `-- name: CountDueDeliveryAttempts :one
 SELECT count(*) FROM delivery_attempts ds
@@ -85,7 +195,7 @@ func (q *Queries) GetDeliveryAttemptsByTargetId(ctx context.Context, targetID pg
 }
 
 const getDeliveryAttemptsList = `-- name: GetDeliveryAttemptsList :many
-SELECT da.id, da.target_id, da.status, da.scheduled_for, da.executed_at, da.response_code, da.response_body, da.response_headers, da.error_message, da.created_at, wt.id, wt.webhook_id, wt.forwarder_id, wt.created_at, w.id, w.name, w.url, w.method, w.body, w.headers, w.query_params, w.webhook_service_id, w.delivery_status, w.created_at, w.idempotency_key
+SELECT da.id, da.target_id, da.status, da.scheduled_for, da.executed_at, da.response_code, da.response_body, da.response_headers, da.error_message, da.created_at, da.hash_value, da.worker_name, wt.id, wt.webhook_id, wt.forwarder_id, wt.created_at, wt.hash_value, w.id, w.name, w.url, w.method, w.body, w.headers, w.query_params, w.webhook_service_id, w.delivery_status, w.created_at, w.idempotency_key
 FROM delivery_attempts da
          JOIN webhook_targets wt ON da.target_id = wt.id
          JOIN webhooks w ON wt.webhook_id = w.id
@@ -117,10 +227,13 @@ type GetDeliveryAttemptsListRow struct {
 	ResponseHeaders  []byte
 	ErrorMessage     pgtype.Text
 	CreatedAt        pgtype.Timestamptz
+	HashValue        int64
+	WorkerName       pgtype.Text
 	ID_2             int64
 	WebhookID        pgtype.Int8
 	ForwarderID      string
 	CreatedAt_2      pgtype.Timestamptz
+	HashValue_2      int64
 	ID_3             int64
 	Name             string
 	Url              string
@@ -160,10 +273,13 @@ func (q *Queries) GetDeliveryAttemptsList(ctx context.Context, arg GetDeliveryAt
 			&i.ResponseHeaders,
 			&i.ErrorMessage,
 			&i.CreatedAt,
+			&i.HashValue,
+			&i.WorkerName,
 			&i.ID_2,
 			&i.WebhookID,
 			&i.ForwarderID,
 			&i.CreatedAt_2,
+			&i.HashValue_2,
 			&i.ID_3,
 			&i.Name,
 			&i.Url,
@@ -187,7 +303,7 @@ func (q *Queries) GetDeliveryAttemptsList(ctx context.Context, arg GetDeliveryAt
 }
 
 const getDueDeliveryAttempts = `-- name: GetDueDeliveryAttempts :many
-SELECT da.id, da.target_id, da.status, da.scheduled_for, da.executed_at, da.response_code, da.response_body, da.response_headers, da.error_message, da.created_at, wt.id, wt.webhook_id, wt.forwarder_id, wt.created_at, w.id, w.name, w.url, w.method, w.body, w.headers, w.query_params, w.webhook_service_id, w.delivery_status, w.created_at, w.idempotency_key FROM delivery_attempts da
+SELECT da.id, da.target_id, da.status, da.scheduled_for, da.executed_at, da.response_code, da.response_body, da.response_headers, da.error_message, da.created_at, da.hash_value, da.worker_name, wt.id, wt.webhook_id, wt.forwarder_id, wt.created_at, wt.hash_value, w.id, w.name, w.url, w.method, w.body, w.headers, w.query_params, w.webhook_service_id, w.delivery_status, w.created_at, w.idempotency_key FROM delivery_attempts da
     JOIN public.webhook_targets wt on da.target_id = wt.id
     JOIN public.webhooks w on wt.webhook_id = w.id
 WHERE da.status = 'scheduled' AND (da.scheduled_for <= $1 OR da.scheduled_for IS NULL)
@@ -204,10 +320,13 @@ type GetDueDeliveryAttemptsRow struct {
 	ResponseHeaders  []byte
 	ErrorMessage     pgtype.Text
 	CreatedAt        pgtype.Timestamptz
+	HashValue        int64
+	WorkerName       pgtype.Text
 	ID_2             int64
 	WebhookID        pgtype.Int8
 	ForwarderID      string
 	CreatedAt_2      pgtype.Timestamptz
+	HashValue_2      int64
 	ID_3             int64
 	Name             string
 	Url              string
@@ -241,10 +360,13 @@ func (q *Queries) GetDueDeliveryAttempts(ctx context.Context, scheduledFor pgtyp
 			&i.ResponseHeaders,
 			&i.ErrorMessage,
 			&i.CreatedAt,
+			&i.HashValue,
+			&i.WorkerName,
 			&i.ID_2,
 			&i.WebhookID,
 			&i.ForwarderID,
 			&i.CreatedAt_2,
+			&i.HashValue_2,
 			&i.ID_3,
 			&i.Name,
 			&i.Url,
@@ -268,7 +390,7 @@ func (q *Queries) GetDueDeliveryAttempts(ctx context.Context, scheduledFor pgtyp
 }
 
 const getMostRecentDeliveryAttemptByWebhookId = `-- name: GetMostRecentDeliveryAttemptByWebhookId :one
-SELECT da.id, target_id, status, scheduled_for, executed_at, response_code, response_body, response_headers, error_message, da.created_at, wt.id, webhook_id, forwarder_id, wt.created_at FROM delivery_attempts da
+SELECT da.id, target_id, status, scheduled_for, executed_at, response_code, response_body, response_headers, error_message, da.created_at, da.hash_value, worker_name, wt.id, webhook_id, forwarder_id, wt.created_at, wt.hash_value FROM delivery_attempts da
          JOIN webhook_targets wt ON da.target_id = wt.id
 WHERE wt.webhook_id = $1
 ORDER BY da.created_at DESC
@@ -286,10 +408,13 @@ type GetMostRecentDeliveryAttemptByWebhookIdRow struct {
 	ResponseHeaders []byte
 	ErrorMessage    pgtype.Text
 	CreatedAt       pgtype.Timestamptz
+	HashValue       int64
+	WorkerName      pgtype.Text
 	ID_2            int64
 	WebhookID       pgtype.Int8
 	ForwarderID     string
 	CreatedAt_2     pgtype.Timestamptz
+	HashValue_2     int64
 }
 
 func (q *Queries) GetMostRecentDeliveryAttemptByWebhookId(ctx context.Context, webhookID pgtype.Int8) (GetMostRecentDeliveryAttemptByWebhookIdRow, error) {
@@ -306,12 +431,44 @@ func (q *Queries) GetMostRecentDeliveryAttemptByWebhookId(ctx context.Context, w
 		&i.ResponseHeaders,
 		&i.ErrorMessage,
 		&i.CreatedAt,
+		&i.HashValue,
+		&i.WorkerName,
 		&i.ID_2,
 		&i.WebhookID,
 		&i.ForwarderID,
 		&i.CreatedAt_2,
+		&i.HashValue_2,
 	)
 	return i, err
+}
+
+const getSortedHashRing = `-- name: GetSortedHashRing :many
+SELECT id, node_name, virtual_id, hash_key FROM hash_ring ORDER BY hash_key
+`
+
+func (q *Queries) GetSortedHashRing(ctx context.Context) ([]HashRing, error) {
+	rows, err := q.db.Query(ctx, getSortedHashRing)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []HashRing
+	for rows.Next() {
+		var i HashRing
+		if err := rows.Scan(
+			&i.ID,
+			&i.NodeName,
+			&i.VirtualID,
+			&i.HashKey,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getUnprocessedWebhooks = `-- name: GetUnprocessedWebhooks :many
@@ -353,7 +510,7 @@ func (q *Queries) GetUnprocessedWebhooks(ctx context.Context) ([]Webhook, error)
 
 const getWebhookTargetDetails = `-- name: GetWebhookTargetDetails :one
 SELECT
-    wt.id, wt.webhook_id, wt.forwarder_id, wt.created_at,
+    wt.id, wt.webhook_id, wt.forwarder_id, wt.created_at, wt.hash_value,
     w.webhook_service_id,
     w.url,
     count(da.id) as attempt_count
@@ -369,6 +526,7 @@ type GetWebhookTargetDetailsRow struct {
 	WebhookID        pgtype.Int8
 	ForwarderID      string
 	CreatedAt        pgtype.Timestamptz
+	HashValue        int64
 	WebhookServiceID string
 	Url              string
 	AttemptCount     int64
@@ -382,6 +540,7 @@ func (q *Queries) GetWebhookTargetDetails(ctx context.Context, id int64) (GetWeb
 		&i.WebhookID,
 		&i.ForwarderID,
 		&i.CreatedAt,
+		&i.HashValue,
 		&i.WebhookServiceID,
 		&i.Url,
 		&i.AttemptCount,
@@ -557,24 +716,26 @@ func (q *Queries) InsertWebhookEvent(ctx context.Context, arg InsertWebhookEvent
 }
 
 const insertWebhookTarget = `-- name: InsertWebhookTarget :one
-INSERT INTO webhook_targets (webhook_id, forwarder_id)
-VALUES ($1, $2)
-RETURNING id, webhook_id, forwarder_id, created_at
+INSERT INTO webhook_targets (webhook_id, forwarder_id, hash_value)
+VALUES ($1, $2, $3)
+RETURNING id, webhook_id, forwarder_id, created_at, hash_value
 `
 
 type InsertWebhookTargetParams struct {
 	WebhookID   pgtype.Int8
 	ForwarderID string
+	HashValue   int64
 }
 
 func (q *Queries) InsertWebhookTarget(ctx context.Context, arg InsertWebhookTargetParams) (WebhookTarget, error) {
-	row := q.db.QueryRow(ctx, insertWebhookTarget, arg.WebhookID, arg.ForwarderID)
+	row := q.db.QueryRow(ctx, insertWebhookTarget, arg.WebhookID, arg.ForwarderID, arg.HashValue)
 	var i WebhookTarget
 	err := row.Scan(
 		&i.ID,
 		&i.WebhookID,
 		&i.ForwarderID,
 		&i.CreatedAt,
+		&i.HashValue,
 	)
 	return i, err
 }
@@ -628,10 +789,56 @@ func (q *Queries) MarkWebhookAsScheduled(ctx context.Context, id int64) error {
 	return err
 }
 
+const reclaimAbandonedDeliveryAttempts = `-- name: ReclaimAbandonedDeliveryAttempts :exec
+UPDATE delivery_attempts
+SET status = 'scheduled', worker_name = NULL, executed_at = NULL
+WHERE status = 'processing' AND executed_at < NOW() - INTERVAL '10 minutes'
+`
+
+func (q *Queries) ReclaimAbandonedDeliveryAttempts(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, reclaimAbandonedDeliveryAttempts)
+	return err
+}
+
+const registerNodeInHashRing = `-- name: RegisterNodeInHashRing :one
+INSERT INTO hash_ring (node_name, virtual_id, hash_key)
+VALUES ($1, $2, $3)
+ON CONFLICT (node_name) DO NOTHING
+RETURNING id, node_name, virtual_id, hash_key
+`
+
+type RegisterNodeInHashRingParams struct {
+	NodeName  string
+	VirtualID int32
+	HashKey   int64
+}
+
+func (q *Queries) RegisterNodeInHashRing(ctx context.Context, arg RegisterNodeInHashRingParams) (HashRing, error) {
+	row := q.db.QueryRow(ctx, registerNodeInHashRing, arg.NodeName, arg.VirtualID, arg.HashKey)
+	var i HashRing
+	err := row.Scan(
+		&i.ID,
+		&i.NodeName,
+		&i.VirtualID,
+		&i.HashKey,
+	)
+	return i, err
+}
+
+const releaseTaskLock = `-- name: ReleaseTaskLock :exec
+DELETE FROM task_locks
+WHERE task_name = $1
+`
+
+func (q *Queries) ReleaseTaskLock(ctx context.Context, taskName string) error {
+	_, err := q.db.Exec(ctx, releaseTaskLock, taskName)
+	return err
+}
+
 const scheduleDeliveryAttempt = `-- name: ScheduleDeliveryAttempt :one
 INSERT INTO delivery_attempts (target_id, scheduled_for, status)
 VALUES ($1, $2, $3)
-RETURNING id, target_id, status, scheduled_for, executed_at, response_code, response_body, response_headers, error_message, created_at
+RETURNING id, target_id, status, scheduled_for, executed_at, response_code, response_body, response_headers, error_message, created_at, hash_value, worker_name
 `
 
 type ScheduleDeliveryAttemptParams struct {
@@ -654,6 +861,8 @@ func (q *Queries) ScheduleDeliveryAttempt(ctx context.Context, arg ScheduleDeliv
 		&i.ResponseHeaders,
 		&i.ErrorMessage,
 		&i.CreatedAt,
+		&i.HashValue,
+		&i.WorkerName,
 	)
 	return i, err
 }
@@ -670,6 +879,15 @@ type SetWebhookIdempotencyKeyParams struct {
 
 func (q *Queries) SetWebhookIdempotencyKey(ctx context.Context, arg SetWebhookIdempotencyKeyParams) error {
 	_, err := q.db.Exec(ctx, setWebhookIdempotencyKey, arg.ID, arg.IdempotencyKey)
+	return err
+}
+
+const touchLock = `-- name: TouchLock :exec
+UPDATE task_locks SET touched_at = NOW() WHERE task_name = $1
+`
+
+func (q *Queries) TouchLock(ctx context.Context, taskName string) error {
+	_, err := q.db.Exec(ctx, touchLock, taskName)
 	return err
 }
 

@@ -2,6 +2,7 @@ package forwarders
 
 import (
 	"errors"
+
 	"laile/internal/config"
 )
 
@@ -12,7 +13,6 @@ func NewForwarder(config *config.Forwarder) (DeliveryAttemptForwarder, error) {
 		activeForwarder, ok := globalConnections.GetConnection(connectionKey)
 		if ok {
 			return activeForwarder, nil
-
 		}
 		activeForwarder = NewRMQForwarder(config)
 		globalConnections.SetConnection(connectionKey, activeForwarder)
