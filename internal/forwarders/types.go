@@ -7,7 +7,7 @@ import (
 
 	"laile/internal/config"
 	"laile/internal/log"
-	db_models "laile/internal/postgresql"
+	dbmodels "laile/internal/postgresql"
 )
 
 type DeliveryAttempt struct {
@@ -19,7 +19,7 @@ type DeliveryAttempt struct {
 	IdempotencyKey string
 }
 
-func NewDeliveryAttempt(event db_models.GetDueDeliveryAttemptsRow, forwarder *config.Forwarder) *DeliveryAttempt {
+func NewDeliveryAttempt(event dbmodels.GetDueDeliveryAttemptsRow, forwarder *config.Forwarder) *DeliveryAttempt {
 	log.Logger.DebugContext(context.Background(), "Creating new delivery attempt",
 		"event_id", event.ID,
 		"body_length", len(event.Body))
@@ -38,11 +38,9 @@ func NewDeliveryAttempt(event db_models.GetDueDeliveryAttemptsRow, forwarder *co
 
 type DeliveryResult struct {
 	// StatusCode is the HTTP status code
-	StatusCode int
+	StatusCode int32
 	Headers    map[string][]string
 	Body       *[]byte
-
-	// TODO: Add more fields later for RMQ
 }
 
 type DeliveryAttemptForwarder interface {

@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"laile/internal/event"
 	"laile/internal/log"
-	db_models "laile/internal/postgresql"
+	dbmodels "laile/internal/postgresql"
 )
 
 func (s *Server) RegisterRoutes() http.Handler {
@@ -80,7 +80,7 @@ func (s *Server) adminDashboardHandler(w http.ResponseWriter, _ *http.Request) {
 }
 
 type DeliveryAttemptsResponse struct {
-	Items   []db_models.GetWebhookTargetsListRow
+	Items   []dbmodels.GetWebhookTargetsListRow
 	HasMore bool
 	LastID  int64
 }
@@ -109,7 +109,7 @@ func (s *Server) deliveryAttemptsHandler(w http.ResponseWriter, r *http.Request)
 	queries := s.db.Queries()
 	ctx := r.Context()
 
-	targets, err := queries.GetWebhookTargetsList(ctx, db_models.GetWebhookTargetsListParams{
+	targets, err := queries.GetWebhookTargetsList(ctx, dbmodels.GetWebhookTargetsListParams{
 		ServiceID:   service,
 		ForwarderID: forwarder,
 		Status:      status,
@@ -149,8 +149,8 @@ func (s *Server) deliveryAttemptsHandler(w http.ResponseWriter, r *http.Request)
 }
 
 type TargetDetailsData struct {
-	Target   db_models.GetWebhookTargetDetailsRow
-	Attempts []db_models.GetDeliveryAttemptsByTargetIdRow
+	Target   dbmodels.GetWebhookTargetDetailsRow
+	Attempts []dbmodels.GetDeliveryAttemptsByTargetIdRow
 }
 
 func (s *Server) targetDetailsHandler(w http.ResponseWriter, r *http.Request) {

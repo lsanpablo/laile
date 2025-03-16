@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"regexp"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/go-playground/validator/v10"
@@ -10,14 +12,31 @@ import (
 
 type Config struct {
 	Settings        Settings                  `toml:"settings"`
+	Database        DatabaseConfig            `toml:"database"         validate:"required"`
 	WebhookServices map[string]WebhookService `toml:"webhook_services" validate:"dive"`
 }
 
 type Settings struct {
-	TickerEnabled  bool `toml:"ticker_enabled"`
-	TickerInterval int  `toml:"ticker_interval" validate:"required_if=TickerEnabled true,gte=1"`
-	ListenerPort   int  `toml:"listener_port"   validate:"required,gte=1,lte=65535"`
-	AdminPort      int  `toml:"admin_port"      validate:"required,gte=1,lte=65535"`
+	TickerEnabled                         bool `toml:"ticker_enabled"`
+	TickerInterval                        int  `toml:"ticker_interval" validate:"required_if=TickerEnabled true,gte=1"`
+	ListenerPort                          int  `toml:"listener_port"   validate:"required,gte=1,lte=65535"`
+	AdminPort                             int  `toml:"admin_port"      validate:"required,gte=1,lte=65535"`
+	RunBackgroundWorkerWithListenerServer bool `toml:"run_background_worker_with_listener_server"`
+}
+
+type DatabaseConfig struct {
+	Host              string        `toml:"host"                validate:"required"`
+	Port              string        `toml:"port"                validate:"required"`
+	Username          string        `toml:"username"            validate:"required"`
+	Password          string        `toml:"password"`
+	Database          string        `toml:"database"            validate:"required"`
+	MaxConns          int32         `toml:"max_conns"           validate:"omitempty,gte=1"`
+	MinConns          int32         `toml:"min_conns"           validate:"omitempty,gte=0"`
+	MaxConnLifetime   string        `toml:"max_conn_lifetime"   validate:"omitempty"`
+	MaxConnIdleTime   string        `toml:"max_conn_idle_time"  validate:"omitempty"`
+	HealthCheckPeriod string        `toml:"health_check_period" validate:"omitempty"`
+	SSLMode           string        `toml:"ssl_mode"            validate:"omitempty,oneof=disable require verify-ca verify-full"`
+	ConnectTimeout    time.Duration `toml:"connect_timeout"     validate:"omitempty"`
 }
 
 type WebhookService struct {
@@ -61,10 +80,20 @@ const (
 
 	// DefaultTickerInterval is the default interval for the event ticker.
 	DefaultTickerInterval = 5
+
+	// Database defaults.
+	DefaultDBMaxConns          = 20
+	DefaultDBMinConns          = 5
+	DefaultDBMaxConnLifetime   = "30m"
+	DefaultDBMaxConnIdleTime   = "5m"
+	DefaultDBHealthCheckPeriod = "1m"
+	DefaultDBSSLMode           = "disable"
+	DefaultDBConnectTimeout    = 10 * time.Second
 )
 
-func loadConfig(path string) (*Config, error) {
-	config := &Config{
+// initializeDefaultConfig creates a new Config with default values.
+func initializeDefaultConfig() *Config {
+	return &Config{
 		Settings: Settings{
 			// Default settings that work well for most deployments.
 			ListenerPort:   DefaultListenerPort,
@@ -72,24 +101,70 @@ func loadConfig(path string) (*Config, error) {
 			TickerEnabled:  true,
 			TickerInterval: DefaultTickerInterval,
 		},
+		Database: DatabaseConfig{ //nolint: exhaustruct // This initializes defaults. We don't care about it being complete.
+			// These will be overridden by the TOML file
+			SSLMode:        DefaultDBSSLMode,
+			ConnectTimeout: DefaultDBConnectTimeout,
+		},
 		WebhookServices: make(map[string]WebhookService),
 	}
+}
 
-	// Read TOML file
-	if _, err := toml.DecodeFile(path, config); err != nil {
-		return nil, fmt.Errorf("failed to decode application config toml: %w", err)
+// applyDatabaseDefaults sets default values for database configuration if not specified.
+func applyDatabaseDefaults(db *DatabaseConfig) {
+	if db.MaxConns == 0 {
+		db.MaxConns = DefaultDBMaxConns
+	}
+	if db.MinConns == 0 {
+		db.MinConns = DefaultDBMinConns
+	}
+	if db.MaxConnLifetime == "" {
+		db.MaxConnLifetime = DefaultDBMaxConnLifetime
+	}
+	if db.MaxConnIdleTime == "" {
+		db.MaxConnIdleTime = DefaultDBMaxConnIdleTime
+	}
+	if db.HealthCheckPeriod == "" {
+		db.HealthCheckPeriod = DefaultDBHealthCheckPeriod
+	}
+	if db.SSLMode == "" {
+		db.SSLMode = DefaultDBSSLMode
+	}
+	if db.ConnectTimeout == 0 {
+		db.ConnectTimeout = DefaultDBConnectTimeout
+	}
+}
+
+// applyForwarderDefaults sets default values for a forwarder.
+func applyForwarderDefaults(forwarder *Forwarder) {
+	// Set sensible defaults for forwarder
+	if forwarder.RetryCount == 0 {
+		forwarder.RetryCount = 3 // Default to 3 retries
+	}
+	if forwarder.RetryDelay == "" {
+		forwarder.RetryDelay = "exponential" // Default to exponential backoff
 	}
 
-	// Create validator
-	validate := validator.New()
-
-	// Register custom validation for path
-	if err := validate.RegisterValidation("alphanum", validateAlphanumeric); err != nil {
-		return nil, fmt.Errorf("failed to register alphanum validation: %w", err)
+	// AMQP defaults for reliability
+	if forwarder.Type == "amqp" {
+		if !forwarder.Durable {
+			forwarder.Durable = true // Default to durable queues
+		}
+		if !forwarder.Persistent {
+			forwarder.Persistent = true // Default to persistent messages
+		}
+		if forwarder.ExchangeType == "" {
+			forwarder.ExchangeType = "direct" // Default exchange type
+		}
 	}
+}
+
+// populateServiceAndForwarderNames sets the Name fields from map keys and applies defaults.
+func populateServiceAndForwarderNames(services map[string]WebhookService) map[string]WebhookService {
+	result := make(map[string]WebhookService)
 
 	// Populate Name fields from map keys and set defaults for each service
-	for serviceName, service := range config.WebhookServices {
+	for serviceName, service := range services {
 		service.Name = serviceName
 
 		// Set default forwarder values if not specified
@@ -97,34 +172,56 @@ func loadConfig(path string) (*Config, error) {
 			forwarder.Name = forwarderName
 			forwarder.Hash = generateUniqueName(serviceName, forwarderName)
 
-			// Set sensible defaults for forwarder
-			if forwarder.RetryCount == 0 {
-				forwarder.RetryCount = 3 // Default to 3 retries
-			}
-			if forwarder.RetryDelay == "" {
-				forwarder.RetryDelay = "exponential" // Default to exponential backoff
-			}
-
-			// AMQP defaults for reliability
-			if forwarder.Type == "amqp" {
-				if !forwarder.Durable {
-					forwarder.Durable = true // Default to durable queues
-				}
-				if !forwarder.Persistent {
-					forwarder.Persistent = true // Default to persistent messages
-				}
-				if forwarder.ExchangeType == "" {
-					forwarder.ExchangeType = "direct" // Default exchange type
-				}
-			}
+			applyForwarderDefaults(&forwarder)
 
 			service.Forwarders[forwarderName] = forwarder
 		}
-		config.WebhookServices[serviceName] = service
+		result[serviceName] = service
+	}
+
+	return result
+}
+
+// setupValidator creates and configures a validator with custom validations.
+func setupValidator() (*validator.Validate, error) {
+	validate := validator.New()
+
+	// Register custom validation for path
+	if err := validate.RegisterValidation("alphanum", validateAlphanumeric); err != nil {
+		return nil, fmt.Errorf("failed to register alphanum validation: %w", err)
+	}
+
+	return validate, nil
+}
+
+func loadConfig(path string) (*Config, error) {
+	// Initialize config with default values
+	config := initializeDefaultConfig()
+
+	// Read TOML file
+	if _, err := toml.DecodeFile(path, config); err != nil { //nolint: musttag,lll // everything that is configurable is tagged, but there are generated fields that are not.
+		return nil, fmt.Errorf("failed to decode application config toml: %w", err)
+	}
+
+	// Apply defaults to database configuration
+	applyDatabaseDefaults(&config.Database)
+
+	// Process webhook services and forwarders
+	config.WebhookServices = populateServiceAndForwarderNames(config.WebhookServices)
+
+	// Setup and run validation
+	validate, err := setupValidator()
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate the config
-	if err := validate.Struct(config); err != nil {
+	if err = validate.Struct(config); err != nil {
+		return nil, err
+	}
+
+	// Validate that paths are unique across all webhook services
+	if err = validateUniquePaths(config); err != nil {
 		return nil, err
 	}
 
@@ -144,11 +241,41 @@ func validateAlphanumeric(fl validator.FieldLevel) bool {
 func LoadMainConfig() (*Config, error) {
 	config, err := loadConfig("webhook_config.toml")
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	return config, nil
 }
 
 func generateUniqueName(serviceName string, forwarderName string) string {
 	return fmt.Sprintf("%s-%s", serviceName, forwarderName)
+}
+
+// validateUniquePaths ensures that no two webhook services have the same path.
+func validateUniquePaths(config *Config) error {
+	pathMap := make(map[string]string) // map[path]serviceName
+
+	// First check service names as paths
+	for serviceName := range config.WebhookServices {
+		pathMap[serviceName] = serviceName
+	}
+
+	// Then check explicit paths
+	for serviceName, service := range config.WebhookServices {
+		if service.Path != "" {
+			if existingService, exists := pathMap[service.Path]; exists {
+				return fmt.Errorf("duplicate webhook path '%s' found in services '%s' and '%s'",
+					service.Path, existingService, serviceName)
+			}
+			pathMap[service.Path] = serviceName
+		}
+	}
+
+	return nil
+}
+
+// GetDSN returns the database connection string.
+func (c *DatabaseConfig) GetDSN() string {
+	hostPort := net.JoinHostPort(c.Host, c.Port)
+	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
+		c.Username, c.Password, hostPort, c.Database, c.SSLMode)
 }
