@@ -5,10 +5,9 @@ import (
 	"net/http"
 	"time"
 
-	_ "github.com/joho/godotenv/autoload"
 	"laile/internal/config"
 	"laile/internal/database"
-	db_models "laile/internal/postgresql"
+	dbmodels "laile/internal/postgresql"
 )
 
 const (
@@ -19,7 +18,7 @@ const (
 type Server struct {
 	port    int
 	db      database.Service
-	queries *db_models.Queries
+	queries *dbmodels.Queries
 	config  *config.Config
 }
 

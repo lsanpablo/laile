@@ -51,12 +51,12 @@ func NewRMQForwarder(config *config.Forwarder) *RMQForwarder {
 }
 
 func (f *RMQForwarder) declareExchange() error {
-	session, err := f.getSession()
+	rmqSession, err := f.getSession()
 	if err != nil {
 		return err
 	}
 
-	return session.Channel.ExchangeDeclare(
+	err = rmqSession.Channel.ExchangeDeclare(
 		f.Config.Exchange,     // name
 		f.Config.ExchangeType, // type
 		f.Config.Durable,      // durable
@@ -65,6 +65,10 @@ func (f *RMQForwarder) declareExchange() error {
 		f.Config.NoWait,       // no-wait
 		nil,                   // arguments
 	)
+	if err != nil {
+		return fmt.Errorf("failed to declare exchange: %w", err)
+	}
+	return nil
 }
 
 func (f *RMQForwarder) Forward(ctx context.Context, deliveryAttempt *DeliveryAttempt) (*DeliveryResult, error) {

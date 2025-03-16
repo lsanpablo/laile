@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -48,7 +49,8 @@ func GetWebhookServiceByPath(currentConfig *config.Config, path string) (*Webhoo
 			return NewWebhookServiceFromConfigWebhookService(name, &service), true
 		}
 	}
-	// TODO, make sure to validate that a path can't match multiple services
+
+	// Path validation is handled during config loading to ensure no duplicates
 	return nil, false
 }
 
@@ -71,7 +73,7 @@ func HandleEvent(dbService database.Service, listener string, request *http.Requ
 	ctx := context.Background()
 	tx, err := dbService.BeginTx(ctx)
 	if err != nil {
-		log.Logger.ErrorContext(ctx, "Failed to begin transaction", "error", err)
+		log.Error(ctx, "Failed to begin transaction", "error", err)
 		return fmt.Errorf("webhook listener failed to begin database transaction: %w", err)
 	}
 	queries := tx.Queries()
@@ -104,12 +106,13 @@ func HandleEvent(dbService database.Service, listener string, request *http.Requ
 	}
 
 	webhookRecord, err := queries.InsertWebhookEvent(ctx, dbmodels.InsertWebhookEventParams{
-		Name:        shortuuid.New(),
-		Url:         request.URL.String(),
-		Method:      request.Method,
-		Body:        payload,
-		Headers:     headersJSONBytes,
-		QueryParams: queryParamsJSONBytes,
+		Name:             shortuuid.New(),
+		Url:              request.URL.String(),
+		Method:           request.Method,
+		Body:             payload,
+		Headers:          headersJSONBytes,
+		QueryParams:      queryParamsJSONBytes,
+		WebhookServiceID: configService.ID,
 	})
 	if err != nil {
 		log.Logger.ErrorContext(ctx, "failed to insert webhook event into database", slog.Any("error", err))
@@ -227,36 +230,116 @@ func generateHashValue(webhookID int64, forwarderID string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func ProcessEvents(ctx context.Context, db database.Service, currentConfig *config.Config) {
+// ProcessEvents listens for events from the database and polls the database for webhooks to deliver.
+// It uses PostgreSQL LISTEN/NOTIFY to listen for events and polls the database on a regular interval.
+func ProcessEvents(ctx context.Context, db database.Service, currentConfig *config.Config) error {
+	// Create a child context that we can cancel if needed
+	processingCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Set up ticker for polling
 	ticker := time.NewTicker(config.DefaultTickerInterval)
 	defer ticker.Stop()
-	log.Logger.InfoContext(ctx, "Event processor started")
-	eventChan := make(chan string)
-	err := ListenForEvents(ctx, eventChan, db)
-	if err != nil {
 
+	log.Logger.InfoContext(ctx, "Event processor started")
+
+	// Create channel for events
+	eventChan := make(chan string)
+
+	// Set up listener for database events
+	err := ListenForEvents(processingCtx, eventChan, db)
+	if err != nil {
+		return fmt.Errorf("failed to listen for events from database: %w", err)
 	}
+
+	// Track consecutive failures to detect persistent issues
+	var consecutiveFailures int
+	const maxConsecutiveFailures = 3
 
 	for {
 		select {
+		case <-ctx.Done():
+			// Parent context was cancelled, exit gracefully
+			log.Logger.InfoContext(ctx, "Shutting down event processor due to context cancellation")
+			return fmt.Errorf("context cancelled: %w", ctx.Err())
 		case <-ticker.C:
 			tickerEnabled := currentConfig.Settings.TickerEnabled
 			if !tickerEnabled {
 				continue
 			}
+
 			log.Logger.DebugContext(ctx, "Processing scheduled events")
 			if err = processEvents(db, currentConfig); err != nil {
+				// Return critical database errors to allow the process to restart
+				if isDatabaseConnectionError(err) {
+					return fmt.Errorf("critical database error while processing scheduled events: %w", err)
+				}
+
+				// Log non-critical errors and continue
 				log.Logger.ErrorContext(ctx, "Failed to process scheduled events", slog.Any("error", err))
+
+				// Track consecutive failures
+				consecutiveFailures++
+				if consecutiveFailures >= maxConsecutiveFailures {
+					return fmt.Errorf("processEvents failed %d consecutive times: %w", consecutiveFailures, err)
+				}
+			} else {
+				// Reset failure counter on success
+				consecutiveFailures = 0
 			}
-		case <-eventChan:
-			log.Logger.DebugContext(ctx, "Processing event from channel")
+
+		case event, ok := <-eventChan:
+			// Check if channel was closed, which indicates a critical listener error
+			if !ok {
+				return errors.New("event channel closed unexpectedly, listener may have failed")
+			}
+
+			log.Logger.DebugContext(ctx, "Processing event from channel", "event", event)
 			if err = processEvents(db, currentConfig); err != nil {
+				// Return critical database errors to allow the process to restart
+				if isDatabaseConnectionError(err) {
+					return fmt.Errorf("critical database error while processing events from channel: %w", err)
+				}
+
+				// Log non-critical errors and continue
 				log.Logger.ErrorContext(ctx, "Failed to process events from channel", slog.Any("error", err))
+
+				// Track consecutive failures
+				consecutiveFailures++
+				if consecutiveFailures >= maxConsecutiveFailures {
+					return fmt.Errorf("processEvents failed %d consecutive times: %w", consecutiveFailures, err)
+				}
+			} else {
+				// Reset failure counter on success
+				consecutiveFailures = 0
 			}
 		}
 	}
 }
 
+// isDatabaseConnectionError checks if an error is related to database connection issues.
+func isDatabaseConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for common PostgreSQL connection error patterns
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "no connection") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "connection closed") ||
+		strings.Contains(errStr, "failed to connect") ||
+		strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "EOF") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "write: connection reset") ||
+		strings.Contains(errStr, "connection terminated") ||
+		strings.Contains(errStr, "connection timed out")
+}
+
+// ListenForEvents listens for events from the database and sends them to the eventChan.
+// It uses PostgreSQL LISTEN/NOTIFY to listen for events.
 func ListenForEvents(ctx context.Context, eventChan chan string, db database.Service) error {
 	const reconnectDelay = 3 * time.Second
 	listener := &pgxlisten.Listener{
@@ -264,7 +347,7 @@ func ListenForEvents(ctx context.Context, eventChan chan string, db database.Ser
 			poolConn, err := db.GetConn(ctx)
 			if err != nil {
 				log.Logger.ErrorContext(ctx, "Failed to get listening connection", slog.Any("error", err))
-				return nil, errors.New("failed to get a listening connection")
+				return nil, fmt.Errorf("failed to get a listening connection: %w", err)
 			}
 			listeningConn := poolConn.RawConn()
 			myListeningConn := listeningConn.Hijack()
@@ -275,6 +358,7 @@ func ListenForEvents(ctx context.Context, eventChan chan string, db database.Ser
 		},
 		ReconnectDelay: reconnectDelay,
 	}
+
 	listener.Handle("webhook_tasks_channel", pgxlisten.HandlerFunc(func(ctx context.Context, notification *pgconn.Notification, _ *pgx.Conn) error {
 		select {
 		case eventChan <- notification.Payload:
@@ -282,13 +366,27 @@ func ListenForEvents(ctx context.Context, eventChan chan string, db database.Ser
 		}
 		return nil
 	}))
+
+	// Start the listener in a separate goroutine
+	listenerErrChan := make(chan error, 1)
 	go func() {
 		err := listener.Listen(ctx)
 		if err != nil {
+			// Send the error to the error channel
+			listenerErrChan <- err
+			// Close the event channel to signal the main loop that the listener has failed
 			close(eventChan)
 		}
 	}()
-	return nil
+
+	// Check if the listener failed to start immediately
+	select {
+	case err := <-listenerErrChan:
+		return fmt.Errorf("listener failed to start: %w", err)
+	case <-time.After(500 * time.Millisecond):
+		// Listener started successfully
+		return nil
+	}
 }
 
 func processEvents(db database.Service, currentConfig *config.Config) error {
@@ -296,7 +394,7 @@ func processEvents(db database.Service, currentConfig *config.Config) error {
 	ctx := context.Background()
 	now := time.Now()
 
-	count, err := queries.CountDueDeliveryAttempts(ctx, pgtype.Timestamptz{Time: now, Valid: true})
+	count, err := queries.CountDueDeliveryAttempts(ctx, pgtype.Timestamptz{Time: now, Valid: true, InfinityModifier: pgtype.Finite})
 	if err != nil {
 		log.Logger.ErrorContext(ctx, "Failed to count due delivery attempts", slog.Any("error", err))
 		return fmt.Errorf("failed get number of due delivery attempts from database: %w", err)
@@ -304,7 +402,7 @@ func processEvents(db database.Service, currentConfig *config.Config) error {
 
 	log.Logger.InfoContext(ctx, "Found events to deliver", "count", count)
 
-	events, err := queries.GetDueDeliveryAttempts(ctx, pgtype.Timestamptz{Time: now, Valid: true})
+	events, err := queries.GetDueDeliveryAttempts(ctx, pgtype.Timestamptz{Time: now, Valid: true, InfinityModifier: pgtype.Finite})
 	if err != nil {
 		log.Logger.ErrorContext(ctx, "failed to get due delivery attempts", slog.Any("error", err))
 		return fmt.Errorf("failed to get due delivery attempts from database: %w", err)
@@ -350,7 +448,7 @@ func getNextExponentialBackoffTime(deliveryAttemptCount int64) time.Duration {
 }
 
 func rescheduleEvent(queries *dbmodels.Queries, event dbmodels.GetDueDeliveryAttemptsRow, errorMessage error) error {
-	deliveryAttemptCount, err := queries.GetDeliveryAttemptCount(context.Background(), pgtype.Int8{Int64: event.ID})
+	deliveryAttemptCount, err := queries.GetDeliveryAttemptCount(context.Background(), pgtype.Int8{Int64: event.ID, Valid: true})
 	if err != nil {
 		return errors.New("failed to get delivery attempt count")
 	}
@@ -365,7 +463,7 @@ func rescheduleEvent(queries *dbmodels.Queries, event dbmodels.GetDueDeliveryAtt
 	}
 	_, err = queries.ScheduleDeliveryAttempt(context.Background(), dbmodels.ScheduleDeliveryAttemptParams{
 		TargetID:     event.TargetID,
-		ScheduledFor: pgtype.Timestamptz{Time: nextAttemptTime, Valid: true},
+		ScheduledFor: pgtype.Timestamptz{Time: nextAttemptTime, Valid: true, InfinityModifier: pgtype.Finite},
 		Status:       dbmodels.DeliveryStatusScheduled,
 	})
 	if err != nil {
@@ -421,7 +519,7 @@ func deliverEvent(event dbmodels.GetDueDeliveryAttemptsRow, db database.Service,
 
 	err = queries.MarkDeliveryAttemptAsSuccess(context.Background(), dbmodels.MarkDeliveryAttemptAsSuccessParams{
 		ID:              event.ID,
-		ResponseCode:    pgtype.Int4{Int32: int32(deliveryResult.StatusCode), Valid: true},
+		ResponseCode:    pgtype.Int4{Int32: deliveryResult.StatusCode, Valid: true},
 		ResponseBody:    bodyResultSQL,
 		ResponseHeaders: headersBytes,
 	})

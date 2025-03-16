@@ -99,7 +99,7 @@ func (f *HTTPForwarder) Forward(ctx context.Context, event *DeliveryAttempt) (*D
 	responseHeadersJSON := internal.HeadersToJSON(responseHeaders)
 
 	return &DeliveryResult{
-		StatusCode: resp.StatusCode,
+		StatusCode: int32(resp.StatusCode), //nolint: gosec // This is a safe cast since we're using a known HTTP status code.
 		Headers:    responseHeadersJSON,
 		Body:       &body,
 	}, nil

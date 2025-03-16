@@ -2,16 +2,14 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
-	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "github.com/joho/godotenv/autoload"
+	"laile/internal/config"
 	"laile/internal/log"
 	dbmodels "laile/internal/postgresql"
 )
@@ -21,6 +19,7 @@ type Service interface {
 	Queries() *dbmodels.Queries
 	BeginTx(ctx context.Context) (Transaction, error)
 	GetConn(ctx context.Context) (Connection, error)
+	Close()
 }
 
 func Rollback(ctx context.Context, tx Transaction) {
@@ -57,45 +56,87 @@ type connection struct {
 	q    *dbmodels.Queries
 }
 
-type dBConnectionConfig struct {
-	Database string
-	Password string
-	Username string
-	Port     string
-	Host     string
-}
-
-func (c dBConnectionConfig) DSN() string {
-	hostWithPort := net.JoinHostPort(c.Host, c.Port)
-	return fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable", c.Username, c.Password, hostWithPort, c.Database)
-}
-
-func New() Service {
+// New creates a new database service using the provided configuration.
+func New(dbConfig *config.DatabaseConfig) (Service, error) {
 	ctx := context.Background()
-	connectionConfig := dBConnectionConfig{
-		Database: os.Getenv("DB_DATABASE"),
-		Password: os.Getenv("DB_PASSWORD"),
-		Username: os.Getenv("DB_USERNAME"),
-		Port:     os.Getenv("DB_PORT"),
-		Host:     os.Getenv("DB_HOST"),
+
+	// Validate required connection parameters
+	if dbConfig.Database == "" || dbConfig.Host == "" {
+		return nil, errors.New("missing required database connection parameters")
 	}
 
-	connStr := connectionConfig.DSN()
+	// Get the DSN string from the poolConfig
+	connStr := dbConfig.GetDSN()
 
 	log.Logger.DebugContext(ctx, "connecting to database", "connection_string", connStr)
 
-	config, err := pgxpool.ParseConfig(connStr)
+	poolConfig, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
-		log.Logger.Error("cannot parse db config", slog.Any("error", err))
+		log.Logger.ErrorContext(ctx, "cannot parse db poolConfig", slog.Any("error", err))
+		return nil, fmt.Errorf("failed to parse database configuration: %w", err)
 	}
 
-	pool, err := pgxpool.NewWithConfig(ctx, config)
+	// Set pool configuration from the provided poolConfig
+	poolConfig.MaxConns = dbConfig.MaxConns
+	poolConfig.MinConns = dbConfig.MinConns
+
+	// Parse durations from string configurations
+	maxConnLifetime, err := time.ParseDuration(dbConfig.MaxConnLifetime)
 	if err != nil {
-		log.Logger.Error("cannot create db pool", slog.Any("error", err))
+		log.Logger.WarnContext(ctx, "Invalid max_conn_lifetime, using default",
+			"value", dbConfig.MaxConnLifetime,
+			"default", poolConfig.MaxConnLifetime)
+	} else {
+		poolConfig.MaxConnLifetime = maxConnLifetime
 	}
 
-	s := &service{pool: pool}
-	return s
+	maxConnIdleTime, err := time.ParseDuration(dbConfig.MaxConnIdleTime)
+	if err != nil {
+		log.Logger.WarnContext(ctx, "Invalid max_conn_idle_time, using default",
+			"value", dbConfig.MaxConnIdleTime,
+			"default", poolConfig.MaxConnIdleTime)
+	} else {
+		poolConfig.MaxConnIdleTime = maxConnIdleTime
+	}
+
+	healthCheckPeriod, err := time.ParseDuration(dbConfig.HealthCheckPeriod)
+	if err != nil {
+		log.Logger.WarnContext(ctx, "Invalid health_check_period, using default",
+			"value", dbConfig.HealthCheckPeriod,
+			"default", poolConfig.HealthCheckPeriod)
+	} else {
+		poolConfig.HealthCheckPeriod = healthCheckPeriod
+	}
+
+	// Log the final connection pool configuration
+	log.Logger.InfoContext(ctx, "Database connection pool configuration",
+		"max_conns", poolConfig.MaxConns,
+		"min_conns", poolConfig.MinConns,
+		"max_conn_lifetime", poolConfig.MaxConnLifetime,
+		"max_conn_idle_time", poolConfig.MaxConnIdleTime,
+		"health_check_period", poolConfig.HealthCheckPeriod,
+		"ssl_mode", dbConfig.SSLMode)
+
+	// Create connection pool with timeout
+	connCtx, cancel := context.WithTimeout(ctx, dbConfig.ConnectTimeout)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(connCtx, poolConfig)
+	if err != nil {
+		log.Logger.ErrorContext(ctx, "cannot create db pool", slog.Any("error", err))
+		return nil, fmt.Errorf("failed to create database connection pool: %w", err)
+	}
+
+	// Verify connection is working
+	err = pool.Ping(connCtx)
+	if err != nil {
+		pool.Close()
+		log.Logger.ErrorContext(ctx, "failed to ping database", slog.Any("error", err))
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	log.Logger.InfoContext(ctx, "Successfully connected to database")
+	return &service{pool: pool}, nil
 }
 
 func (s *service) Health() map[string]string {

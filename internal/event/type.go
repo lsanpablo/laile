@@ -2,7 +2,6 @@ package event
 
 import (
 	"fmt"
-	"net/http"
 
 	validation "github.com/go-ozzo/ozzo-validation"
 	"laile/internal/config"
@@ -34,8 +33,4 @@ type WebhookService struct {
 	Name   string
 	Path   string
 	Config *config.WebhookService
-}
-
-func (ws *WebhookService) IsAuthenticated(request *http.Request) (bool, error) {
-	return true, nil
 }
