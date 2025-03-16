@@ -24,13 +24,15 @@ func main() {
 		panic(fmt.Sprintf("cannot create database: %s", err))
 	}
 
-	// TODO: add app server config settings
-	go func() {
-		err = event.ProcessEvents(context.Background(), db, appConfig)
-		if err != nil {
-			panic(fmt.Sprintf("cannot start event processor: %s", err))
-		}
-	}()
+	// Start a background worker if configured to do so
+	if appConfig.Settings.RunBackgroundWorkerWithListenerServer {
+		go func() {
+			err = event.ProcessEvents(context.Background(), db, appConfig)
+			if err != nil {
+				panic(fmt.Sprintf("cannot start event processor: %s", err))
+			}
+		}()
+	}
 
 	// Start AdminServer in a goroutine
 	go func() {

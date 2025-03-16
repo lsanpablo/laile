@@ -18,9 +18,9 @@ type Config struct {
 
 type Settings struct {
 	TickerEnabled                         bool `toml:"ticker_enabled"`
-	TickerInterval                        int  `toml:"ticker_interval" validate:"required_if=TickerEnabled true,gte=1"`
-	ListenerPort                          int  `toml:"listener_port"   validate:"required,gte=1,lte=65535"`
-	AdminPort                             int  `toml:"admin_port"      validate:"required,gte=1,lte=65535"`
+	TickerInterval                        int  `toml:"ticker_interval"                            validate:"required_if=TickerEnabled true,gte=1"`
+	ListenerPort                          int  `toml:"listener_port"                              validate:"required,gte=1,lte=65535"`
+	AdminPort                             int  `toml:"admin_port"                                 validate:"required,gte=1,lte=65535"`
 	RunBackgroundWorkerWithListenerServer bool `toml:"run_background_worker_with_listener_server"`
 }
 
